@@ -1,0 +1,29 @@
+# singbox_dash
+
+singbox_dash is a small local control panel prototype for building sing-box server/client configurations.
+
+Current goals:
+
+- Manage multiple inbound services with different protocol combinations.
+- Separate users, protocols, TLS, transport, and certificate settings.
+- Export a ready-to-use sing-box server config.
+- Export a selected user's client config.
+- Provide a plain subscription endpoint with common share links.
+
+## Run
+
+```bash
+go run .
+```
+
+Open:
+
+```text
+http://127.0.0.1:8088
+```
+
+State is saved to `data/state.json`.
+
+## Notes
+
+This is an implementation prototype. Before exposing it to the internet, add authentication, HTTPS for the panel itself, stricter validation, and firewall/process controls.

@@ -1,0 +1,6 @@
+singbox_dash
+singbox_dash.exe
+data/
+*.log
+.env
+.DS_Store
