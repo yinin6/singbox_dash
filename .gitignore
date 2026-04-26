@@ -1,6 +1,31 @@
-singbox_dash
-singbox_dash.exe
+# 运行时数据
 data/
-*.log
-.env
+
+# 工作记忆（开发工具内部文件）
+.workbuddy/
+
+# Go 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go 测试与覆盖率
+*.test
+*.out
+coverage.html
+
+# 依赖目录
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
