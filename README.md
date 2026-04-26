@@ -25,6 +25,24 @@ http://127.0.0.1:8088
 
 State is saved to `data/state.json`.
 
+## Apply to sing-box
+
+The panel can manage a local sing-box process without systemd:
+
+1. Click `检测配置` to run `sing-box check`.
+2. Click `应用到 sing-box` to write the generated server config, validate it, stop the previous managed process, and start `sing-box run -c <config>`.
+3. Use the runtime section to inspect status or stop the managed process.
+
+Default runtime files:
+
+```text
+data/runtime/server.json
+data/runtime/sing-box.pid
+data/runtime/sing-box.log
+```
+
+For production, run the panel with permissions that can bind the configured ports, or switch the services to high ports behind a reverse proxy/firewall rule.
+
 ## Certificates
 
 Certificate profiles support:

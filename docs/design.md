@@ -36,12 +36,20 @@ Supported transport knobs:
 
 ### Runtime manager
 
-Add a sing-box binary path setting, then implement:
+The panel now has a local process manager mode:
 
 - validate generated config with `sing-box check`
 - write active config to a configurable path
-- start, stop, restart, and status
-- view recent logs
+- stop the previous managed sing-box process by PID
+- start `sing-box run -c <config>`
+- expose status, PID, config path, and log path
+
+Still planned:
+
+- log tail endpoint
+- systemd mode for production servers
+- health probes and automatic recovery
+- reload hooks after certificate renewal
 
 ### Certificate manager
 

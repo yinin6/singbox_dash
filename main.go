@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,9 +43,14 @@ type AppState struct {
 }
 
 type PanelSettings struct {
-	Host        string `json:"host"`
-	DNSStrategy string `json:"dns_strategy"`
-	SubToken    string `json:"sub_token"`
+	Host              string `json:"host"`
+	DNSStrategy       string `json:"dns_strategy"`
+	SubToken          string `json:"sub_token"`
+	SingBoxPath       string `json:"sing_box_path"`
+	RuntimeConfigPath string `json:"runtime_config_path"`
+	RuntimePIDPath    string `json:"runtime_pid_path"`
+	RuntimeLogPath    string `json:"runtime_log_path"`
+	AutoRestart       bool   `json:"auto_restart"`
 }
 
 type Certificate struct {
@@ -114,6 +120,9 @@ func main() {
 	mux.HandleFunc("/api/certificate", certificateCreateHandler)
 	mux.HandleFunc("/api/certificate/", certificateItemHandler)
 	mux.HandleFunc("/api/validate/server", serverValidateHandler)
+	mux.HandleFunc("/api/runtime/apply", runtimeApplyHandler)
+	mux.HandleFunc("/api/runtime/status", runtimeStatusHandler)
+	mux.HandleFunc("/api/runtime/stop", runtimeStopHandler)
 	mux.HandleFunc("/export/server.json", serverConfigHandler)
 	mux.HandleFunc("/export/client.json", clientConfigHandler)
 	mux.HandleFunc("/sub/", subscriptionHandler)
@@ -186,9 +195,14 @@ func defaultState() AppState {
 	certID := "cert-default"
 	return AppState{
 		Panel: PanelSettings{
-			Host:        "example.com",
-			DNSStrategy: "prefer_ipv4",
-			SubToken:    token,
+			Host:              "example.com",
+			DNSStrategy:       "prefer_ipv4",
+			SubToken:          token,
+			SingBoxPath:       "sing-box",
+			RuntimeConfigPath: filepath.ToSlash(filepath.Join(stateDir, "runtime", "server.json")),
+			RuntimePIDPath:    filepath.ToSlash(filepath.Join(stateDir, "runtime", "sing-box.pid")),
+			RuntimeLogPath:    filepath.ToSlash(filepath.Join(stateDir, "runtime", "sing-box.log")),
+			AutoRestart:       true,
 		},
 		Certificates: []Certificate{
 			{
@@ -264,6 +278,18 @@ func normalizeState(s *AppState) {
 	}
 	if s.Panel.SubToken == "" {
 		s.Panel.SubToken = randomHex(16)
+	}
+	if s.Panel.SingBoxPath == "" {
+		s.Panel.SingBoxPath = "sing-box"
+	}
+	if s.Panel.RuntimeConfigPath == "" {
+		s.Panel.RuntimeConfigPath = filepath.ToSlash(filepath.Join(stateDir, "runtime", "server.json"))
+	}
+	if s.Panel.RuntimePIDPath == "" {
+		s.Panel.RuntimePIDPath = filepath.ToSlash(filepath.Join(stateDir, "runtime", "sing-box.pid"))
+	}
+	if s.Panel.RuntimeLogPath == "" {
+		s.Panel.RuntimeLogPath = filepath.ToSlash(filepath.Join(stateDir, "runtime", "sing-box.log"))
 	}
 	for i := range s.Certificates {
 		cert := &s.Certificates[i]
@@ -556,8 +582,35 @@ func serverValidateHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	result := validateSingBoxConfig(buildServerConfig(store.snapshot()))
+	state := store.snapshot()
+	result := validateSingBoxConfig(state.Panel.SingBoxPath, buildServerConfig(state))
 	writeJSON(w, result)
+}
+
+func runtimeApplyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, applyRuntimeConfig(store.snapshot()))
+}
+
+func runtimeStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, runtimeStatus(store.snapshot().Panel))
+}
+
+func runtimeStopHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	panel := store.snapshot().Panel
+	status := stopRuntime(panel)
+	writeJSON(w, status)
 }
 
 func clientConfigHandler(w http.ResponseWriter, r *http.Request) {
@@ -814,31 +867,76 @@ func issueCertificate(id string) (Certificate, error) {
 	return cert, nil
 }
 
-func validateSingBoxConfig(cfg map[string]any) map[string]any {
-	bin, err := exec.LookPath("sing-box")
-	if err != nil {
-		return map[string]any{
-			"ok":      false,
-			"message": "sing-box command not found",
-		}
-	}
+func validateSingBoxConfig(binPath string, cfg map[string]any) map[string]any {
 	temp, err := os.CreateTemp("", "singbox_dash_*.json")
 	if err != nil {
 		return map[string]any{"ok": false, "message": err.Error()}
 	}
 	defer os.Remove(temp.Name())
-	enc := json.NewEncoder(temp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(cfg); err != nil {
-		_ = temp.Close()
+	if err := writeConfigFile(temp.Name(), cfg); err != nil {
 		return map[string]any{"ok": false, "message": err.Error()}
 	}
-	if err := temp.Close(); err != nil {
-		return map[string]any{"ok": false, "message": err.Error()}
+	return checkSingBoxConfig(binPath, temp.Name())
+}
+
+func applyRuntimeConfig(state AppState) map[string]any {
+	panel := state.Panel
+	cfg := buildServerConfig(state)
+	if err := writeConfigFile(panel.RuntimeConfigPath, cfg); err != nil {
+		return map[string]any{"ok": false, "stage": "write", "message": err.Error()}
+	}
+	check := checkSingBoxConfig(panel.SingBoxPath, panel.RuntimeConfigPath)
+	if ok, _ := check["ok"].(bool); !ok {
+		check["stage"] = "check"
+		check["config_path"] = panel.RuntimeConfigPath
+		return check
+	}
+	if panel.AutoRestart {
+		stopRuntime(panel)
+		start := startRuntime(panel)
+		start["stage"] = "start"
+		start["config_path"] = panel.RuntimeConfigPath
+		return start
+	}
+	status := runtimeStatus(panel)
+	status["ok"] = true
+	status["stage"] = "write"
+	status["message"] = "config written and validated; auto restart is disabled"
+	status["config_path"] = panel.RuntimeConfigPath
+	return status
+}
+
+func writeConfigFile(path string, cfg map[string]any) error {
+	if path == "" {
+		return errors.New("config path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cfg); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func checkSingBoxConfig(binPath string, configPath string) map[string]any {
+	bin, err := resolveSingBoxPath(binPath)
+	if err != nil {
+		return map[string]any{
+			"ok":      false,
+			"message": err.Error(),
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "check", "-c", temp.Name())
+	cmd := exec.CommandContext(ctx, bin, "check", "-c", configPath)
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		return map[string]any{"ok": false, "message": "sing-box check timed out", "output": string(out)}
@@ -847,6 +945,199 @@ func validateSingBoxConfig(cfg map[string]any) map[string]any {
 		return map[string]any{"ok": false, "message": err.Error(), "output": string(out)}
 	}
 	return map[string]any{"ok": true, "message": "sing-box check passed", "output": string(out)}
+}
+
+func startRuntime(panel PanelSettings) map[string]any {
+	bin, err := resolveSingBoxPath(panel.SingBoxPath)
+	if err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	if err := os.MkdirAll(filepath.Dir(panel.RuntimePIDPath), 0o700); err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	if err := os.MkdirAll(filepath.Dir(panel.RuntimeLogPath), 0o700); err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	logFile, err := os.OpenFile(panel.RuntimeLogPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	cmd := exec.Command(bin, "run", "-c", panel.RuntimeConfigPath)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	_ = logFile.Close()
+	if err := os.WriteFile(panel.RuntimePIDPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		_ = cmd.Process.Kill()
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	_ = cmd.Process.Release()
+	time.Sleep(300 * time.Millisecond)
+	status := runtimeStatus(panel)
+	if running, _ := status["running"].(bool); !running {
+		status["ok"] = false
+		status["message"] = "sing-box started but exited immediately; check runtime log"
+		status["log_tail"] = tailFile(panel.RuntimeLogPath, 4000)
+		return status
+	}
+	status["ok"] = true
+	status["message"] = "sing-box is running"
+	return status
+}
+
+func stopRuntime(panel PanelSettings) map[string]any {
+	pids := runtimePIDs(panel)
+	if len(pids) == 0 {
+		return map[string]any{"ok": true, "running": false, "message": "sing-box is not managed by this panel"}
+	}
+	for _, pid := range pids {
+		proc, err := os.FindProcess(pid)
+		if err == nil {
+			_ = proc.Signal(os.Interrupt)
+			for i := 0; i < 20; i++ {
+				if !processRunning(pid) {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if processRunning(pid) {
+				_ = proc.Kill()
+			}
+		}
+	}
+	_ = os.Remove(panel.RuntimePIDPath)
+	return map[string]any{"ok": true, "running": false, "pids": pids, "message": "sing-box stopped"}
+}
+
+func runtimeStatus(panel PanelSettings) map[string]any {
+	pids := runtimePIDs(panel)
+	if len(pids) == 0 {
+		_ = os.Remove(panel.RuntimePIDPath)
+		return map[string]any{
+			"running":     false,
+			"message":     "not running",
+			"config_path": panel.RuntimeConfigPath,
+			"log_path":    panel.RuntimeLogPath,
+			"log_tail":    tailFile(panel.RuntimeLogPath, 4000),
+		}
+	}
+	return map[string]any{
+		"running":     true,
+		"pid":         pids[0],
+		"pids":        pids,
+		"message":     "running",
+		"config_path": panel.RuntimeConfigPath,
+		"log_path":    panel.RuntimeLogPath,
+		"log_tail":    tailFile(panel.RuntimeLogPath, 4000),
+	}
+}
+
+func resolveSingBoxPath(path string) (string, error) {
+	if path == "" {
+		path = "sing-box"
+	}
+	if strings.ContainsRune(path, filepath.Separator) || strings.HasPrefix(path, ".") {
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			return path, nil
+		}
+		return "", fmt.Errorf("sing-box binary not found at %s", path)
+	}
+	bin, err := exec.LookPath(path)
+	if err != nil {
+		return "", fmt.Errorf("%s command not found", path)
+	}
+	return bin, nil
+}
+
+func readRuntimePID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+func runtimePIDs(panel PanelSettings) []int {
+	seen := map[int]bool{}
+	pids := []int{}
+	if pid, err := readRuntimePID(panel.RuntimePIDPath); err == nil && processRunning(pid) {
+		seen[pid] = true
+		pids = append(pids, pid)
+	}
+	for _, pid := range findProcessesByConfig(panel.RuntimeConfigPath) {
+		if !seen[pid] && processRunning(pid) {
+			seen[pid] = true
+			pids = append(pids, pid)
+		}
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+func findProcessesByConfig(configPath string) []int {
+	matches := []int{}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return matches
+	}
+	absConfig, _ := filepath.Abs(configPath)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		cmdline := strings.ReplaceAll(string(data), "\x00", " ")
+		if strings.Contains(cmdline, "sing-box") &&
+			strings.Contains(cmdline, " run ") &&
+			(strings.Contains(cmdline, configPath) || (absConfig != "" && strings.Contains(cmdline, absConfig))) {
+			matches = append(matches, pid)
+		}
+	}
+	return matches
+}
+
+func processRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err == nil {
+		for _, line := range strings.Split(string(status), "\n") {
+			if strings.HasPrefix(line, "State:") {
+				return !strings.Contains(line, "Z (zombie)")
+			}
+		}
+		return true
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(nil) == nil
+}
+
+func tailFile(path string, limit int) string {
+	if path == "" || limit <= 0 {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if len(data) > limit {
+		data = data[len(data)-limit:]
+	}
+	return string(data)
 }
 
 func prepareCertificatePaths(cert Certificate) error {
@@ -1291,6 +1582,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     <div class="row">
       <button class="primary" onclick="saveState()">保存</button>
       <button onclick="validateServer()">检测配置</button>
+      <button class="secondary" onclick="applyRuntime()">应用到 sing-box</button>
       <a class="button" href="/export/server.json" target="_blank">服务端 JSON</a>
       <a class="button" id="clientLink" href="/export/client.json" target="_blank">客户端 JSON</a>
     </div>
@@ -1312,6 +1604,24 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
           </label>
           <label>订阅 Token <input id="subToken" oninput="updatePanel()"></label>
           <div class="mono" id="subUrl"></div>
+        </div>
+      </section>
+      <section>
+        <div class="row between">
+          <h2>运行时</h2>
+          <button onclick="refreshRuntimeStatus()">状态</button>
+        </div>
+        <div class="stack">
+          <label>sing-box 路径 <input id="singBoxPath" oninput="updatePanel()" placeholder="sing-box"></label>
+          <label>运行配置 <input id="runtimeConfigPath" oninput="updatePanel()" placeholder="data/runtime/server.json"></label>
+          <label>PID 文件 <input id="runtimePIDPath" oninput="updatePanel()" placeholder="data/runtime/sing-box.pid"></label>
+          <label>日志文件 <input id="runtimeLogPath" oninput="updatePanel()" placeholder="data/runtime/sing-box.log"></label>
+          <label class="row"><input id="autoRestart" type="checkbox" onchange="updatePanel()"> 应用后自动重启</label>
+          <div class="row">
+            <button class="secondary" onclick="applyRuntime()">应用</button>
+            <button class="danger" onclick="stopRuntime()">停止</button>
+          </div>
+          <div class="mono" id="runtimeStatus">未查询</div>
         </div>
       </section>
       <section>
@@ -1446,6 +1756,11 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       $("host").value = state.panel.host || "";
       $("dnsStrategy").value = state.panel.dns_strategy || "prefer_ipv4";
       $("subToken").value = state.panel.sub_token || "";
+      $("singBoxPath").value = state.panel.sing_box_path || "sing-box";
+      $("runtimeConfigPath").value = state.panel.runtime_config_path || "data/runtime/server.json";
+      $("runtimePIDPath").value = state.panel.runtime_pid_path || "data/runtime/sing-box.pid";
+      $("runtimeLogPath").value = state.panel.runtime_log_path || "data/runtime/sing-box.log";
+      $("autoRestart").checked = state.panel.auto_restart !== false;
       $("subUrl").textContent = location.origin + "/sub/" + state.panel.sub_token + "?user=" + encodeURIComponent(firstUserId());
       $("clientLink").href = "/export/client.json?user=" + encodeURIComponent(firstUserId());
       renderServices();
@@ -1583,6 +1898,11 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       state.panel.host = $("host").value;
       state.panel.dns_strategy = $("dnsStrategy").value;
       state.panel.sub_token = $("subToken").value;
+      state.panel.sing_box_path = $("singBoxPath").value;
+      state.panel.runtime_config_path = $("runtimeConfigPath").value;
+      state.panel.runtime_pid_path = $("runtimePIDPath").value;
+      state.panel.runtime_log_path = $("runtimeLogPath").value;
+      state.panel.auto_restart = $("autoRestart").checked;
       $("subUrl").textContent = location.origin + "/sub/" + state.panel.sub_token + "?user=" + encodeURIComponent(firstUserId());
     }
 
@@ -1648,6 +1968,35 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       if (currentTab !== "preview") setTab("preview");
       $("previewType").value = "server";
       $("preview").value = (result.message || "") + "\n\n" + (result.output || "");
+    }
+
+    async function applyRuntime() {
+      await saveState({render: false});
+      const result = await fetch("/api/runtime/apply", {method: "POST"}).then(r => r.json());
+      $("status").textContent = result.ok ? "已应用到 sing-box" : "应用失败";
+      showRuntimeResult(result);
+    }
+
+    async function stopRuntime() {
+      const result = await fetch("/api/runtime/stop", {method: "POST"}).then(r => r.json());
+      $("status").textContent = "sing-box 已停止";
+      showRuntimeResult(result);
+    }
+
+    async function refreshRuntimeStatus() {
+      const result = await fetch("/api/runtime/status").then(r => r.json());
+      showRuntimeResult(result);
+    }
+
+    function showRuntimeResult(result) {
+      $("runtimeStatus").textContent =
+        "状态: " + (result.running ? "运行中" : "未运行") +
+        (result.pid ? "\nPID: " + result.pid : "") +
+        "\n消息: " + (result.message || "") +
+        "\n配置: " + (result.config_path || state.panel.runtime_config_path || "") +
+        "\n日志: " + (result.log_path || state.panel.runtime_log_path || "");
+      if (currentTab !== "preview") setTab("preview");
+      $("preview").value = JSON.stringify(result, null, 2) + (result.log_tail ? "\n\n--- log tail ---\n" + result.log_tail : "");
     }
 
     function renderPreviewUsers() {
