@@ -104,12 +104,6 @@
               <option value="udp">UDP</option>
             </select>
           </label>
-          <label>TLS 类型
-            <select id="svcTLSMode" onchange="updateService()">
-              <option value="standard">标准 TLS</option>
-              <option value="reality">Reality</option>
-            </select>
-          </label>
           <label>路径 / gRPC Service <input id="svcPath" oninput="updateService()" placeholder="/proxy"></label>
           <label>证书
             <select id="svcCert" onchange="updateService()"></select>
@@ -120,23 +114,7 @@
           <label class="row"><input id="svcEnabled" type="checkbox" onchange="updateService()"> 启用</label>
           <label class="row"><input id="svcTLS" type="checkbox" onchange="updateService()"> TLS</label>
         </div>
-        <div class="card stack">
-          <div class="row between">
-            <h3>Reality</h3>
-            <div class="muted">推荐在证书管理中维护 Reality 档案；这里保留兼容旧配置。</div>
-          </div>
-          <div class="grid">
-            <label>握手域名 <input id="realityHandshakeServer" oninput="updateService()" placeholder="www.cloudflare.com"></label>
-            <label>握手端口 <input id="realityHandshakePort" type="number" min="1" max="65535" oninput="updateService()"></label>
-            <label>Private Key <input id="realityPrivateKey" oninput="updateService()"></label>
-            <label>Public Key <input id="realityPublicKey" oninput="updateService()"></label>
-            <label>Short ID <input id="realityShortID" oninput="updateService()" placeholder="8 hex chars"></label>
-            <label>uTLS 指纹 <select id="utlsFingerprint" onchange="updateService()">
-              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option><option value="edge">edge</option><option value="ios">ios</option><option value="android">android</option>
-            </select></label>
-            <label>最大时间差 <input id="realityMaxTimeDiff" oninput="updateService()" placeholder="1m"></label>
-          </div>
-        </div>
+        <div class="inline-note">Reality 已收敛到证书档案。为服务选择一个 Reality 模式证书即可。</div>
         <div class="row between">
           <h3>用户</h3>
           <button onclick="addUser()">+</button>

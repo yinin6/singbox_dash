@@ -86,10 +86,13 @@ function renderCerts() {
   $("certList").innerHTML = "";
   for (const cert of state.certificates || []) {
     const card = document.createElement("div");
-    card.className = "card stack";
+    card.className = "card cert-card stack";
     const expires = cert.expires_at && !cert.expires_at.startsWith("0001-") ? new Date(cert.expires_at).toLocaleString() : "未读取";
+    const mode = cert.mode || "file";
+    const realityAction =
+      mode === "reality" ? '<button onclick="generateCertRealityKeypair(\'' + cert.id + '\')">Reality 密钥</button>' : "";
     card.innerHTML =
-      '<div class="row between">' +
+      '<div class="row between cert-header">' +
       '<div class="cert-status"><strong>' +
       escapeHTML(cert.last_status || "unknown") +
       "</strong><br>" +
@@ -97,15 +100,15 @@ function renderCerts() {
       "<br>到期：" +
       escapeHTML(expires) +
       "</div>" +
-      '<div class="row"><button onclick="issueCert(\'' +
+      '<div class="cert-actions"><button onclick="issueCert(\'' +
       cert.id +
       "')\">签发/续期</button><button onclick=\"refreshCert('" +
       cert.id +
-      "')\">刷新</button><button onclick=\"generateCertRealityKeypair('" +
-      cert.id +
-      "')\">Reality 密钥</button></div>" +
+      "')\">刷新</button>" +
+      realityAction +
       "</div>" +
-      '<div class="grid">' +
+      "</div>" +
+      '<div class="cert-grid">' +
       '<label>名称 <input value="' +
       escapeAttr(cert.name || "") +
       '" data-cert="' +
@@ -116,41 +119,50 @@ function renderCerts() {
       '" data-field="mode">' +
       '<option value="file">手动文件</option><option value="self_signed">自签名</option><option value="reality">Reality</option><option value="acme_http">ACME HTTP-01</option><option value="acme_tls_alpn">ACME TLS-ALPN-01</option><option value="acme_dns">ACME DNS-01</option>' +
       "</select></label>" +
-      '<label>服务名 <input value="' +
+      '<label>' +
+      (mode === "reality" ? "握手域名" : "服务名") +
+      ' <input value="' +
       escapeAttr(cert.server_name || "") +
       '" data-cert="' +
       cert.id +
       '" data-field="server_name"></label>' +
-      '<label>邮箱 <input value="' +
-      escapeAttr(cert.email || "") +
-      '" data-cert="' +
+      buildCertificateModeFields(cert, mode) +
+      "</div>" +
+      buildCertificateExtraFields(cert, mode) +
+      '<label class="row"><input type="checkbox" data-cert="' +
       cert.id +
-      '" data-field="email"></label>' +
-      '<label>CA <select data-cert="' +
+      '" data-field="auto_renew"> 自动续期</label>' +
+      '<button class="danger" onclick="deleteCert(\'' +
       cert.id +
-      '" data-field="ca">' +
-      '<option value="letsencrypt">Lets Encrypt</option><option value="zerossl">ZeroSSL</option><option value="buypass">Buypass</option><option value="ssl.com">SSL.com</option>' +
-      "</select></label>" +
-      '<label>Webroot <input value="' +
-      escapeAttr(cert.webroot || "") +
-      '" data-cert="' +
-      cert.id +
-      '" data-field="webroot" placeholder="/var/www/html"></label>' +
-      '<label>DNS Provider <input value="' +
-      escapeAttr(cert.dns_provider || "") +
-      '" data-cert="' +
-      cert.id +
-      '" data-field="dns_provider" placeholder="dns_cf / dns_ali / dns_dp"></label>' +
-      '<label>证书路径 <input value="' +
-      escapeAttr(cert.cert_path || "") +
-      '" data-cert="' +
-      cert.id +
-      '" data-field="cert_path"></label>' +
-      '<label>私钥路径 <input value="' +
-      escapeAttr(cert.key_path || "") +
-      '" data-cert="' +
-      cert.id +
-      '" data-field="key_path"></label>' +
+      "')\">删除证书</button>";
+    $("certList").appendChild(card);
+    card.querySelector('[data-field="mode"]').value = cert.mode || "file";
+    const caField = card.querySelector('[data-field="ca"]');
+    if (caField) caField.value = cert.ca || "letsencrypt";
+    card.querySelector('[data-field="auto_renew"]').checked = !!cert.auto_renew;
+    const utlsField = card.querySelector('[data-field="utls_fingerprint"]');
+    if (utlsField) utlsField.value = cert.utls_fingerprint || "chrome";
+  }
+  $("certList").querySelectorAll("input, select").forEach((el) => {
+    el.oninput = () => {
+      const cert = state.certificates.find((c) => c.id === el.dataset.cert);
+      cert[el.dataset.field] = el.type === "checkbox" ? el.checked : el.value;
+      if (el.dataset.field === "mode") {
+        render();
+      }
+    };
+  });
+  $("certList").querySelectorAll("textarea").forEach((el) => {
+    el.oninput = () => {
+      const cert = state.certificates.find((c) => c.id === el.dataset.cert);
+      cert[el.dataset.field] = el.value;
+    };
+  });
+}
+
+function buildCertificateModeFields(cert, mode) {
+  if (mode === "reality") {
+    return (
       '<label>Reality 端口 <input value="' +
       escapeAttr(cert.reality_port || "443") +
       '" data-cert="' +
@@ -178,38 +190,63 @@ function renderCerts() {
       escapeAttr(cert.reality_max_time_diff || "1m") +
       '" data-cert="' +
       cert.id +
-      '" data-field="reality_max_time_diff"></label>' +
-      "</div>" +
-      '<label>DNS 环境变量 <textarea data-cert="' +
-      cert.id +
-      '" data-field="dns_credentials" placeholder="CF_Token=...&#10;CF_Account_ID=...">' +
-      escapeHTML(cert.dns_credentials || "") +
-      "</textarea></label>" +
-      '<label class="row"><input type="checkbox" data-cert="' +
-      cert.id +
-      '" data-field="auto_renew"> 自动续期</label>' +
-      '<button class="danger" onclick="deleteCert(\'' +
-      cert.id +
-      "')\">删除证书</button>";
-    $("certList").appendChild(card);
-    card.querySelector('[data-field="mode"]').value = cert.mode || "file";
-    card.querySelector('[data-field="ca"]').value = cert.ca || "letsencrypt";
-    card.querySelector('[data-field="auto_renew"]').checked = !!cert.auto_renew;
-    card.querySelector('[data-field="utls_fingerprint"]').value = cert.utls_fingerprint || "chrome";
+      '" data-field="reality_max_time_diff"></label>'
+    );
   }
-  $("certList").querySelectorAll("input, select").forEach((el) => {
-    el.oninput = () => {
-      const cert = state.certificates.find((c) => c.id === el.dataset.cert);
-      cert[el.dataset.field] = el.type === "checkbox" ? el.checked : el.value;
-      renderEditor();
-    };
-  });
-  $("certList").querySelectorAll("textarea").forEach((el) => {
-    el.oninput = () => {
-      const cert = state.certificates.find((c) => c.id === el.dataset.cert);
-      cert[el.dataset.field] = el.value;
-    };
-  });
+
+  let html = "";
+  if (mode === "acme_http" || mode === "acme_tls_alpn" || mode === "acme_dns") {
+    html +=
+      '<label>邮箱 <input value="' +
+      escapeAttr(cert.email || "") +
+      '" data-cert="' +
+      cert.id +
+      '" data-field="email"></label>' +
+      '<label>CA <select data-cert="' +
+      cert.id +
+      '" data-field="ca">' +
+      '<option value="letsencrypt">Lets Encrypt</option><option value="zerossl">ZeroSSL</option><option value="buypass">Buypass</option><option value="ssl.com">SSL.com</option>' +
+      "</select></label>";
+  }
+  if (mode === "acme_http") {
+    html +=
+      '<label>Webroot <input value="' +
+      escapeAttr(cert.webroot || "") +
+      '" data-cert="' +
+      cert.id +
+      '" data-field="webroot" placeholder="/var/www/html"></label>';
+  }
+  if (mode === "acme_dns") {
+    html +=
+      '<label>DNS Provider <input value="' +
+      escapeAttr(cert.dns_provider || "") +
+      '" data-cert="' +
+      cert.id +
+      '" data-field="dns_provider" placeholder="dns_cf / dns_ali / dns_dp"></label>';
+  }
+  html +=
+    '<label>证书路径 <input value="' +
+    escapeAttr(cert.cert_path || "") +
+    '" data-cert="' +
+    cert.id +
+    '" data-field="cert_path"></label>' +
+    '<label>私钥路径 <input value="' +
+    escapeAttr(cert.key_path || "") +
+    '" data-cert="' +
+    cert.id +
+    '" data-field="key_path"></label>';
+  return html;
+}
+
+function buildCertificateExtraFields(cert, mode) {
+  if (mode !== "acme_dns") return "";
+  return (
+    '<label>DNS 环境变量 <textarea data-cert="' +
+    cert.id +
+    '" data-field="dns_credentials" placeholder="CF_Token=...&#10;CF_Account_ID=...">' +
+    escapeHTML(cert.dns_credentials || "") +
+    "</textarea></label>"
+  );
 }
 
 async function deleteCert(id) {
@@ -250,18 +287,10 @@ function renderEditor() {
   $("svcListen").value = svc.listen || "::";
   $("svcPort").value = svc.port || 443;
   $("svcTransport").value = svc.transport || "tcp";
-  $("svcTLSMode").value = svc.tls_mode || "standard";
   $("svcPath").value = svc.path || "";
   $("svcMethod").value = svc.method || "";
   $("svcEnabled").checked = !!svc.enabled;
   $("svcTLS").checked = !!svc.tls;
-  $("realityHandshakeServer").value = svc.reality_handshake_server || "www.cloudflare.com";
-  $("realityHandshakePort").value = svc.reality_handshake_port || 443;
-  $("realityPrivateKey").value = svc.reality_private_key || "";
-  $("realityPublicKey").value = svc.reality_public_key || "";
-  $("realityShortID").value = svc.reality_short_id || "";
-  $("utlsFingerprint").value = svc.utls_fingerprint || "chrome";
-  $("realityMaxTimeDiff").value = svc.reality_max_time_diff || "1m";
   $("svcCert").innerHTML =
     '<option value="">未选择</option>' +
     (state.certificates || [])
@@ -334,19 +363,11 @@ function updateService() {
   svc.listen = $("svcListen").value;
   svc.port = Number($("svcPort").value || 0);
   svc.transport = $("svcTransport").value;
-  svc.tls_mode = $("svcTLSMode").value;
   svc.path = $("svcPath").value;
   svc.method = $("svcMethod").value;
   svc.cert_id = $("svcCert").value;
   svc.enabled = $("svcEnabled").checked;
   svc.tls = $("svcTLS").checked;
-  svc.reality_handshake_server = $("realityHandshakeServer").value;
-  svc.reality_handshake_port = Number($("realityHandshakePort").value || 443);
-  svc.reality_private_key = $("realityPrivateKey").value;
-  svc.reality_public_key = $("realityPublicKey").value;
-  svc.reality_short_id = $("realityShortID").value;
-  svc.utls_fingerprint = $("utlsFingerprint").value;
-  svc.reality_max_time_diff = $("realityMaxTimeDiff").value;
   renderServices();
 }
 
