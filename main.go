@@ -93,6 +93,7 @@ type User struct {
 	Name     string `json:"name"`
 	UUID     string `json:"uuid"`
 	Password string `json:"password"`
+	Flow     string `json:"flow"`
 }
 
 type Store struct {
@@ -230,10 +231,10 @@ func defaultState() AppState {
 				Port:      443,
 				TLS:       true,
 				CertID:    certID,
-				Transport: "ws",
+				Transport: "http",
 				Path:      "/vless",
 				Users: []User{
-					{ID: "user-main", Name: "main", UUID: randomUUID(), Password: randomHex(12)},
+					{ID: "user-main", Name: "main", UUID: randomUUID(), Password: randomHex(12), Flow: "xtls-rprx-vision"},
 				},
 			},
 			{
@@ -363,6 +364,9 @@ func normalizeState(s *AppState) {
 			}
 			if svc.Users[j].Password == "" {
 				svc.Users[j].Password = randomHex(14)
+			}
+			if svc.Protocol == "vless" && svc.Users[j].Flow == "" && svc.Transport == "tcp" {
+				svc.Users[j].Flow = "xtls-rprx-vision"
 			}
 		}
 	}
@@ -661,7 +665,11 @@ func buildServerConfig(state AppState) map[string]any {
 		case "vless":
 			users := make([]any, 0, len(svc.Users))
 			for _, u := range svc.Users {
-				users = append(users, map[string]any{"name": u.Name, "uuid": u.UUID})
+				user := map[string]any{"name": u.Name, "uuid": u.UUID}
+				if u.Flow != "" {
+					user["flow"] = u.Flow
+				}
+				users = append(users, user)
 			}
 			inbound["users"] = users
 		case "trojan":
@@ -727,6 +735,9 @@ func buildClientConfig(state AppState, userID string) (map[string]any, error) {
 		switch svc.Protocol {
 		case "vless":
 			ob["uuid"] = user.UUID
+			if user.Flow != "" {
+				ob["flow"] = user.Flow
+			}
 		case "trojan", "hysteria2":
 			ob["password"] = user.Password
 		case "shadowsocks":
@@ -784,6 +795,9 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 			}
 			if svc.Path != "" {
 				q.Set("path", svc.Path)
+			}
+			if user.Flow != "" {
+				q.Set("flow", user.Flow)
 			}
 			lines = append(lines, subscriptionLine{Name: name, URL: fmt.Sprintf("vless://%s@%s:%d?%s#%s", user.UUID, state.Panel.Host, svc.Port, q.Encode(), url.QueryEscape(name))})
 		case "trojan":
@@ -1353,7 +1367,11 @@ func transportConfig(svc Service) map[string]any {
 		}
 		return out
 	case "http":
-		return map[string]any{"type": "http"}
+		out := map[string]any{"type": "http"}
+		if svc.Path != "" {
+			out["path"] = svc.Path
+		}
+		return out
 	default:
 		return nil
 	}
@@ -1667,7 +1685,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <option value="tcp">TCP</option>
               <option value="ws">WebSocket</option>
               <option value="grpc">gRPC</option>
-              <option value="http">HTTP</option>
+              <option value="http">HTTP / H2</option>
               <option value="udp">UDP</option>
             </select>
           </label>
@@ -1881,11 +1899,15 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
             '<label>用户名 <input value="' + escapeAttr(user.name || "") + '" data-user="' + user.id + '" data-field="name"></label>' +
             '<label>UUID <input value="' + escapeAttr(user.uuid || "") + '" data-user="' + user.id + '" data-field="uuid"></label>' +
             '<label>密码 <input value="' + escapeAttr(user.password || "") + '" data-user="' + user.id + '" data-field="password"></label>' +
+            '<label>VLESS Flow <select data-user="' + user.id + '" data-field="flow">' +
+              '<option value="">none</option><option value="xtls-rprx-vision">xtls-rprx-vision</option>' +
+            '</select></label>' +
           '</div>' +
           '<button class="danger" onclick="deleteUser(\'' + user.id + '\')">删除用户</button>';
         $("userList").appendChild(card);
+        card.querySelector('[data-field="flow"]').value = user.flow || "";
       }
-      $("userList").querySelectorAll("input").forEach(el => {
+      $("userList").querySelectorAll("input, select").forEach(el => {
         el.oninput = () => {
           const user = currentService().users.find(u => u.id === el.dataset.user);
           user[el.dataset.field] = el.value;
@@ -1925,7 +1947,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     function addUser() {
       const svc = currentService();
       svc.users = svc.users || [];
-      svc.users.push({id: "user-" + rand(), name: "user", uuid: crypto.randomUUID(), password: rand() + rand()});
+      svc.users.push({id: "user-" + rand(), name: "user", uuid: crypto.randomUUID(), password: rand() + rand(), flow: svc.protocol === "vless" && svc.transport === "tcp" ? "xtls-rprx-vision" : ""});
       renderUsers(svc);
       renderPreviewUsers();
     }

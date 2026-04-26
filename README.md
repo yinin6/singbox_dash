@@ -11,6 +11,8 @@ Current goals:
 - Export a selected user's client config.
 - Provide a plain subscription endpoint with common share links.
 
+The VLESS editor supports `flow=xtls-rprx-vision` and HTTP/H2 transport, which is a better default than WebSocket for newer clients.
+
 ## Run
 
 ```bash
