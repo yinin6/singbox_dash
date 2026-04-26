@@ -113,6 +113,7 @@ func main() {
 	mux.HandleFunc("/api/service/", serviceItemHandler)
 	mux.HandleFunc("/api/certificate", certificateCreateHandler)
 	mux.HandleFunc("/api/certificate/", certificateItemHandler)
+	mux.HandleFunc("/api/validate/server", serverValidateHandler)
 	mux.HandleFunc("/export/server.json", serverConfigHandler)
 	mux.HandleFunc("/export/client.json", clientConfigHandler)
 	mux.HandleFunc("/sub/", subscriptionHandler)
@@ -550,6 +551,15 @@ func serverConfigHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, buildServerConfig(store.snapshot()))
 }
 
+func serverValidateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	result := validateSingBoxConfig(buildServerConfig(store.snapshot()))
+	writeJSON(w, result)
+}
+
 func clientConfigHandler(w http.ResponseWriter, r *http.Request) {
 	state := store.snapshot()
 	userID := r.URL.Query().Get("user")
@@ -635,7 +645,7 @@ func buildServerConfig(state AppState) map[string]any {
 		"log": map[string]any{"level": "info"},
 		"dns": map[string]any{
 			"strategy": state.Panel.DNSStrategy,
-			"servers":  []any{map[string]any{"tag": "cloudflare", "address": "1.1.1.1"}},
+			"servers":  []any{map[string]any{"type": "udp", "tag": "cloudflare", "server": "1.1.1.1"}},
 		},
 		"inbounds": inbounds,
 		"outbounds": []any{
@@ -802,6 +812,41 @@ func issueCertificate(id string) (Certificate, error) {
 		return cert, runErr
 	}
 	return cert, nil
+}
+
+func validateSingBoxConfig(cfg map[string]any) map[string]any {
+	bin, err := exec.LookPath("sing-box")
+	if err != nil {
+		return map[string]any{
+			"ok":      false,
+			"message": "sing-box command not found",
+		}
+	}
+	temp, err := os.CreateTemp("", "singbox_dash_*.json")
+	if err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	defer os.Remove(temp.Name())
+	enc := json.NewEncoder(temp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(cfg); err != nil {
+		_ = temp.Close()
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	if err := temp.Close(); err != nil {
+		return map[string]any{"ok": false, "message": err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "check", "-c", temp.Name())
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return map[string]any{"ok": false, "message": "sing-box check timed out", "output": string(out)}
+	}
+	if err != nil {
+		return map[string]any{"ok": false, "message": err.Error(), "output": string(out)}
+	}
+	return map[string]any{"ok": true, "message": "sing-box check passed", "output": string(out)}
 }
 
 func prepareCertificatePaths(cert Certificate) error {
@@ -1245,6 +1290,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     </div>
     <div class="row">
       <button class="primary" onclick="saveState()">保存</button>
+      <button onclick="validateServer()">检测配置</button>
       <a class="button" href="/export/server.json" target="_blank">服务端 JSON</a>
       <a class="button" id="clientLink" href="/export/client.json" target="_blank">客户端 JSON</a>
     </div>
@@ -1593,6 +1639,15 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         const body = await fetch(sub).then(r => r.text());
         $("preview").value = sub + "\n\n" + body;
       }
+    }
+
+    async function validateServer() {
+      await saveState({render: false});
+      const result = await fetch("/api/validate/server", {method: "POST"}).then(r => r.json());
+      $("status").textContent = result.ok ? "服务端配置检测通过" : "服务端配置检测失败";
+      if (currentTab !== "preview") setTab("preview");
+      $("previewType").value = "server";
+      $("preview").value = (result.message || "") + "\n\n" + (result.output || "");
     }
 
     function renderPreviewUsers() {
