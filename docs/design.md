@@ -32,7 +32,7 @@ Supported transport knobs:
 - HTTP/H2
 - UDP
 
-VLESS users can set `flow=xtls-rprx-vision`. The panel intentionally does not emit Xray-only `xhttp` or `seed` options into sing-box configs until sing-box supports compatible fields.
+VLESS users can set `flow=xtls-rprx-vision`. The default VLESS profile is TCP + TLS + Vision for cross-client compatibility. The panel intentionally does not emit Xray-only `xhttp` or `seed` options into sing-box configs until sing-box supports compatible fields.
 
 ## Planned modules
 

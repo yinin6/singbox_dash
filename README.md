@@ -11,7 +11,7 @@ Current goals:
 - Export a selected user's client config.
 - Provide a plain subscription endpoint with common share links.
 
-The VLESS editor supports `flow=xtls-rprx-vision` and HTTP/H2 transport, which is a better default than WebSocket for newer clients.
+The VLESS editor supports `flow=xtls-rprx-vision`. The default VLESS profile uses TCP + TLS + Vision because newer Xray clients have removed legacy HTTP transport and warn on WebSocket.
 
 ## Run
 

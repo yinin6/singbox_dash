@@ -224,15 +224,14 @@ func defaultState() AppState {
 		Services: []Service{
 			{
 				ID:        "svc-vless-ws",
-				Name:      "VLESS WS TLS",
+				Name:      "VLESS TCP Vision TLS",
 				Protocol:  "vless",
 				Enabled:   true,
 				Listen:    "::",
 				Port:      443,
 				TLS:       true,
 				CertID:    certID,
-				Transport: "http",
-				Path:      "/vless",
+				Transport: "tcp",
 				Users: []User{
 					{ID: "user-main", Name: "main", UUID: randomUUID(), Password: randomHex(12), Flow: "xtls-rprx-vision"},
 				},
