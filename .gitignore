@@ -5,6 +5,7 @@ data/
 .workbuddy/
 
 # Go 编译产物
+singbox_dash
 *.exe
 *.exe~
 *.dll

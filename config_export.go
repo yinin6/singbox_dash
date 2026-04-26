@@ -258,7 +258,16 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 		case "hysteria2":
 			q := url.Values{}
 			if svc.TLS {
-				q.Set("sni", certByID(state, svc.CertID).ServerName)
+				cert := certByID(state, svc.CertID)
+				q.Set("security", "tls")
+				q.Set("sni", cert.ServerName)
+				// 自签名证书附加 SHA256 pin 和验证信息
+				if cert.Mode == "self_signed" {
+					if pcs, err := certificateSHA256Hex(cert.CertPath); err == nil {
+						q.Set("pcs", pcs)
+						q.Set("vcn", cert.ServerName)
+					}
+				}
 			}
 			lines = append(lines, subscriptionLine{Name: name, URL: fmt.Sprintf("hysteria2://%s@%s:%d/?%s#%s", url.QueryEscape(user.Password), state.Panel.Host, svc.Port, q.Encode(), url.QueryEscape(name))})
 		case "shadowsocks":
