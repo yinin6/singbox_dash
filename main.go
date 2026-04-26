@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -795,7 +796,10 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 				q.Set("security", "tls")
 				q.Set("sni", cert.ServerName)
 				if cert.Mode == "self_signed" {
-					q.Set("allowInsecure", "1")
+					if pcs, err := certificateSHA256Hex(cert.CertPath); err == nil {
+						q.Set("pcs", pcs)
+						q.Set("vcn", cert.ServerName)
+					}
 				}
 			}
 			if svc.Transport != "tcp" {
@@ -1351,6 +1355,19 @@ func refreshCertificateStatus(cert *Certificate) {
 		cert.LastStatus = "valid"
 	}
 	cert.LastMessage = "certificate is present"
+}
+
+func certificateSHA256Hex(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return "", errors.New("certificate PEM block not found")
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func tlsConfig(state AppState, svc Service) map[string]any {
