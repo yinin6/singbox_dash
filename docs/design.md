@@ -13,7 +13,7 @@ The current implementation focuses on configuration generation and leaves proces
 ## Current model
 
 - `PanelSettings`: public host, DNS strategy, subscription token.
-- `Certificate`: file-based or ACME-style certificate profile.
+- `Certificate`: manual, self-signed, or ACME certificate profile with status and expiry tracking.
 - `Service`: protocol, listen address, port, TLS, transport, path, method, and users.
 - `User`: name, UUID, and password.
 
@@ -45,12 +45,19 @@ Add a sing-box binary path setting, then implement:
 
 ### Certificate manager
 
-Extend certificate profiles into:
+Certificate profiles now cover:
 
 - manual file upload/path mode
-- ACME HTTP-01/TLS-ALPN-01 mode
+- self-signed mode for local smoke tests and private deployments
+- ACME HTTP-01, TLS-ALPN-01, and DNS-01 modes through `acme.sh`
 - expiration detection
-- renew and reload hooks
+- renew actions
+
+Still planned:
+
+- scheduled auto-renew worker
+- sing-box reload hooks after successful renewal
+- provider-specific validation hints for DNS credentials
 
 ### Access control
 

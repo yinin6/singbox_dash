@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -10,14 +12,20 @@ import (
 	"html/template"
 	"log"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 )
 
 const (
@@ -40,13 +48,23 @@ type PanelSettings struct {
 }
 
 type Certificate struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Mode       string `json:"mode"`
-	ServerName string `json:"server_name"`
-	CertPath   string `json:"cert_path"`
-	KeyPath    string `json:"key_path"`
-	Email      string `json:"email"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Mode           string    `json:"mode"`
+	ServerName     string    `json:"server_name"`
+	CertPath       string    `json:"cert_path"`
+	KeyPath        string    `json:"key_path"`
+	Email          string    `json:"email"`
+	CA             string    `json:"ca"`
+	Challenge      string    `json:"challenge"`
+	Webroot        string    `json:"webroot"`
+	DNSProvider    string    `json:"dns_provider"`
+	DNSCredentials string    `json:"dns_credentials"`
+	AutoRenew      bool      `json:"auto_renew"`
+	LastStatus     string    `json:"last_status"`
+	LastMessage    string    `json:"last_message"`
+	LastIssuedAt   time.Time `json:"last_issued_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 type Service struct {
@@ -173,13 +191,18 @@ func defaultState() AppState {
 		},
 		Certificates: []Certificate{
 			{
-				ID:         certID,
-				Name:       "Default TLS",
-				Mode:       "file",
-				ServerName: "example.com",
-				CertPath:   "/etc/sing-box/cert/fullchain.pem",
-				KeyPath:    "/etc/sing-box/cert/privkey.pem",
-				Email:      "admin@example.com",
+				ID:          certID,
+				Name:        "Default TLS",
+				Mode:        "file",
+				ServerName:  "example.com",
+				CertPath:    "/etc/sing-box/cert/fullchain.pem",
+				KeyPath:     "/etc/sing-box/cert/privkey.pem",
+				Email:       "admin@example.com",
+				CA:          "letsencrypt",
+				Challenge:   "http",
+				AutoRenew:   true,
+				LastStatus:  "manual",
+				LastMessage: "manual file certificate",
 			},
 		},
 		Services: []Service{
@@ -242,11 +265,49 @@ func normalizeState(s *AppState) {
 		s.Panel.SubToken = randomHex(16)
 	}
 	for i := range s.Certificates {
-		if s.Certificates[i].ID == "" {
-			s.Certificates[i].ID = "cert-" + randomHex(6)
+		cert := &s.Certificates[i]
+		if cert.ID == "" {
+			cert.ID = "cert-" + randomHex(6)
 		}
-		if s.Certificates[i].Mode == "" {
-			s.Certificates[i].Mode = "file"
+		if cert.Mode == "" {
+			cert.Mode = "file"
+		}
+		if cert.Mode == "acme" {
+			cert.Mode = "acme_http"
+		}
+		if cert.CA == "" {
+			cert.CA = "letsencrypt"
+		}
+		if cert.Challenge == "" {
+			switch cert.Mode {
+			case "acme_dns":
+				cert.Challenge = "dns"
+			case "acme_tls_alpn":
+				cert.Challenge = "tls_alpn"
+			default:
+				cert.Challenge = "http"
+			}
+		}
+		if cert.ServerName == "" {
+			cert.ServerName = s.Panel.Host
+		}
+		if cert.Email == "" {
+			cert.Email = "admin@" + strings.TrimPrefix(cert.ServerName, "*.")
+		}
+		if cert.Mode != "file" {
+			base := filepath.ToSlash(filepath.Join(stateDir, "certs", cert.ID))
+			if cert.CertPath == "" || strings.HasPrefix(cert.CertPath, "/etc/sing-box/cert/") {
+				cert.CertPath = filepath.ToSlash(filepath.Join(base, "fullchain.pem"))
+			}
+			if cert.KeyPath == "" || strings.HasPrefix(cert.KeyPath, "/etc/sing-box/cert/") {
+				cert.KeyPath = filepath.ToSlash(filepath.Join(base, "privkey.pem"))
+			}
+			if cert.LastStatus == "" {
+				cert.LastStatus = "not_issued"
+			}
+		}
+		if cert.Mode == "file" && cert.LastStatus == "" {
+			cert.LastStatus = "manual"
 		}
 	}
 	for i := range s.Services {
@@ -382,13 +443,20 @@ func certificateCreateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := store.mutate(func(s *AppState) error {
+		id := "cert-" + randomHex(6)
 		s.Certificates = append(s.Certificates, Certificate{
-			ID:         "cert-" + randomHex(6),
-			Name:       "New Certificate",
-			Mode:       "file",
-			ServerName: s.Panel.Host,
-			CertPath:   "/etc/sing-box/cert/fullchain.pem",
-			KeyPath:    "/etc/sing-box/cert/privkey.pem",
+			ID:          id,
+			Name:        "New Managed Certificate",
+			Mode:        "acme_http",
+			ServerName:  s.Panel.Host,
+			CertPath:    filepath.ToSlash(filepath.Join(stateDir, "certs", id, "fullchain.pem")),
+			KeyPath:     filepath.ToSlash(filepath.Join(stateDir, "certs", id, "privkey.pem")),
+			Email:       "admin@" + strings.TrimPrefix(s.Panel.Host, "*."),
+			CA:          "letsencrypt",
+			Challenge:   "http",
+			AutoRenew:   true,
+			LastStatus:  "not_issued",
+			LastMessage: "created",
 		})
 		return nil
 	}); err != nil {
@@ -399,9 +467,21 @@ func certificateCreateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func certificateItemHandler(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/certificate/")
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/certificate/"), "/"), "/")
+	id := ""
+	if len(parts) > 0 {
+		id = parts[0]
+	}
 	if id == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "issue" {
+		certificateIssueHandler(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "status" {
+		certificateStatusHandler(w, r, id)
 		return
 	}
 	switch r.Method {
@@ -428,6 +508,42 @@ func certificateItemHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func certificateIssueHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	cert, err := issueCertificate(id)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, cert)
+}
+
+func certificateStatusHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var out Certificate
+	err := store.mutate(func(s *AppState) error {
+		for i := range s.Certificates {
+			if s.Certificates[i].ID == id {
+				refreshCertificateStatus(&s.Certificates[i])
+				out = s.Certificates[i]
+				return nil
+			}
+		}
+		return fmt.Errorf("certificate %s not found", id)
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, out)
 }
 
 func serverConfigHandler(w http.ResponseWriter, r *http.Request) {
@@ -638,21 +754,251 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 	return lines
 }
 
+func issueCertificate(id string) (Certificate, error) {
+	var cert Certificate
+	var runErr error
+
+	err := store.mutate(func(s *AppState) error {
+		for i := range s.Certificates {
+			if s.Certificates[i].ID != id {
+				continue
+			}
+			cert = s.Certificates[i]
+			if err := prepareCertificatePaths(cert); err != nil {
+				s.Certificates[i].LastStatus = "error"
+				s.Certificates[i].LastMessage = err.Error()
+				cert = s.Certificates[i]
+				return nil
+			}
+			switch cert.Mode {
+			case "self_signed":
+				runErr = writeSelfSignedCertificate(cert)
+			case "acme_http", "acme_tls_alpn", "acme_dns":
+				runErr = runACMEScript(cert)
+			case "file":
+				runErr = fmt.Errorf("manual file certificates cannot be issued automatically")
+			default:
+				runErr = fmt.Errorf("unsupported certificate mode %s", cert.Mode)
+			}
+			if runErr != nil {
+				s.Certificates[i].LastStatus = "error"
+				s.Certificates[i].LastMessage = runErr.Error()
+				cert = s.Certificates[i]
+				return nil
+			}
+			s.Certificates[i].LastStatus = "issued"
+			s.Certificates[i].LastMessage = "certificate issued"
+			s.Certificates[i].LastIssuedAt = time.Now()
+			refreshCertificateStatus(&s.Certificates[i])
+			cert = s.Certificates[i]
+			return nil
+		}
+		return fmt.Errorf("certificate %s not found", id)
+	})
+	if err != nil {
+		return Certificate{}, err
+	}
+	if runErr != nil {
+		return cert, runErr
+	}
+	return cert, nil
+}
+
+func prepareCertificatePaths(cert Certificate) error {
+	if strings.TrimSpace(cert.ServerName) == "" {
+		return errors.New("server name is required")
+	}
+	if strings.TrimSpace(cert.CertPath) == "" || strings.TrimSpace(cert.KeyPath) == "" {
+		return errors.New("certificate and key paths are required")
+	}
+	if err := os.MkdirAll(filepath.Dir(cert.CertPath), 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cert.KeyPath), 0o700); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeSelfSignedCertificate(cert Certificate) error {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	tpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName: cert.ServerName,
+		},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.AddDate(1, 0, 0),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{cert.ServerName},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tpl, &tpl, &key.PublicKey, key)
+	if err != nil {
+		return err
+	}
+	certFile, err := os.OpenFile(cert.CertPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		_ = certFile.Close()
+		return err
+	}
+	if err := certFile.Close(); err != nil {
+		return err
+	}
+	keyFile, err := os.OpenFile(cert.KeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(keyFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
+		_ = keyFile.Close()
+		return err
+	}
+	return keyFile.Close()
+}
+
+func runACMEScript(cert Certificate) error {
+	acme, err := findACMEScript()
+	if err != nil {
+		return err
+	}
+	home := filepath.Join(stateDir, "acme")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return err
+	}
+	args := []string{"--issue", "-d", cert.ServerName, "--home", home, "--server", cert.CA}
+	switch cert.Mode {
+	case "acme_http":
+		if cert.Webroot != "" {
+			args = append(args, "--webroot", cert.Webroot)
+		} else {
+			args = append(args, "--standalone")
+		}
+	case "acme_tls_alpn":
+		args = append(args, "--alpn")
+	case "acme_dns":
+		if cert.DNSProvider == "" {
+			return errors.New("DNS provider is required for DNS-01")
+		}
+		args = append(args, "--dns", cert.DNSProvider)
+	}
+	if cert.Email != "" {
+		args = append(args, "--accountemail", cert.Email)
+	}
+	if out, err := runCommandWithEnv(acme, args, cert.DNSCredentials); err != nil {
+		return fmt.Errorf("%s: %s", err, trimCommandOutput(out))
+	}
+
+	installArgs := []string{
+		"--install-cert", "-d", cert.ServerName,
+		"--home", home,
+		"--server", cert.CA,
+		"--fullchain-file", cert.CertPath,
+		"--key-file", cert.KeyPath,
+	}
+	if out, err := runCommandWithEnv(acme, installArgs, cert.DNSCredentials); err != nil {
+		return fmt.Errorf("%s: %s", err, trimCommandOutput(out))
+	}
+	return nil
+}
+
+func findACMEScript() (string, error) {
+	if path, err := exec.LookPath("acme.sh"); err == nil {
+		return path, nil
+	}
+	home, _ := os.UserHomeDir()
+	candidate := filepath.Join(home, ".acme.sh", "acme.sh")
+	if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+		return candidate, nil
+	}
+	return "", errors.New("acme.sh not found; install it first or use self_signed/manual file mode")
+}
+
+func runCommandWithEnv(name string, args []string, envText string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), parseEnvLines(envText)...)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), errors.New("command timed out")
+	}
+	return string(out), err
+}
+
+func parseEnvLines(text string) []string {
+	lines := []string{}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func trimCommandOutput(out string) string {
+	out = strings.TrimSpace(out)
+	if len(out) > 1200 {
+		return out[len(out)-1200:]
+	}
+	return out
+}
+
+func refreshCertificateStatus(cert *Certificate) {
+	data, err := os.ReadFile(cert.CertPath)
+	if err != nil {
+		if cert.LastStatus == "issued" {
+			cert.LastStatus = "missing"
+			cert.LastMessage = err.Error()
+		}
+		return
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		cert.LastStatus = "error"
+		cert.LastMessage = "certificate PEM block not found"
+		return
+	}
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		cert.LastStatus = "error"
+		cert.LastMessage = err.Error()
+		return
+	}
+	cert.ExpiresAt = parsed.NotAfter
+	if time.Until(parsed.NotAfter) < 30*24*time.Hour {
+		cert.LastStatus = "renew_due"
+		cert.LastMessage = "certificate expires within 30 days"
+		return
+	}
+	if cert.LastStatus == "" || cert.LastStatus == "missing" || cert.LastStatus == "renew_due" {
+		cert.LastStatus = "valid"
+	}
+	cert.LastMessage = "certificate is present"
+}
+
 func tlsConfig(state AppState, svc Service) map[string]any {
 	cert := certByID(state, svc.CertID)
 	tls := map[string]any{
 		"enabled":     true,
 		"server_name": cert.ServerName,
 	}
-	if cert.Mode == "acme" {
-		tls["acme"] = map[string]any{
-			"domain": cert.ServerName,
-			"email":  cert.Email,
-		}
-	} else {
-		tls["certificate_path"] = cert.CertPath
-		tls["key_path"] = cert.KeyPath
-	}
+	tls["certificate_path"] = cert.CertPath
+	tls["key_path"] = cert.KeyPath
 	return tls
 }
 
@@ -837,6 +1183,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       font: inherit;
     }
     textarea { min-height: 360px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; resize: vertical; }
+    .card textarea { min-height: 84px; }
     button, a.button {
       border: 1px solid var(--line);
       background: #fff;
@@ -879,6 +1226,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     .hidden { display: none; }
     .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
     .status { min-height: 20px; color: var(--accent); font-size: 13px; }
+    .cert-status { color: var(--muted); font-size: 12px; }
+    .cert-status strong { color: var(--ink); }
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
       main { grid-template-columns: 1fr; padding: 12px; }
@@ -1076,26 +1425,46 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       for (const cert of state.certificates || []) {
         const card = document.createElement("div");
         card.className = "card stack";
+        const expires = cert.expires_at && !cert.expires_at.startsWith("0001-") ? new Date(cert.expires_at).toLocaleString() : "未读取";
         card.innerHTML =
+          '<div class="row between">' +
+            '<div class="cert-status"><strong>' + escapeHTML(cert.last_status || "unknown") + '</strong><br>' + escapeHTML(cert.last_message || "") + '<br>到期：' + escapeHTML(expires) + '</div>' +
+            '<div class="row"><button onclick="issueCert(\'' + cert.id + '\')">签发/续期</button><button onclick="refreshCert(\'' + cert.id + '\')">刷新</button></div>' +
+          '</div>' +
           '<div class="grid">' +
             '<label>名称 <input value="' + escapeAttr(cert.name || "") + '" data-cert="' + cert.id + '" data-field="name"></label>' +
             '<label>模式 <select data-cert="' + cert.id + '" data-field="mode">' +
-              '<option value="file">file</option><option value="acme">acme</option>' +
+              '<option value="file">手动文件</option><option value="self_signed">自签名</option><option value="acme_http">ACME HTTP-01</option><option value="acme_tls_alpn">ACME TLS-ALPN-01</option><option value="acme_dns">ACME DNS-01</option>' +
             '</select></label>' +
             '<label>服务名 <input value="' + escapeAttr(cert.server_name || "") + '" data-cert="' + cert.id + '" data-field="server_name"></label>' +
             '<label>邮箱 <input value="' + escapeAttr(cert.email || "") + '" data-cert="' + cert.id + '" data-field="email"></label>' +
+            '<label>CA <select data-cert="' + cert.id + '" data-field="ca">' +
+              '<option value="letsencrypt">Lets Encrypt</option><option value="zerossl">ZeroSSL</option><option value="buypass">Buypass</option><option value="ssl.com">SSL.com</option>' +
+            '</select></label>' +
+            '<label>Webroot <input value="' + escapeAttr(cert.webroot || "") + '" data-cert="' + cert.id + '" data-field="webroot" placeholder="/var/www/html"></label>' +
+            '<label>DNS Provider <input value="' + escapeAttr(cert.dns_provider || "") + '" data-cert="' + cert.id + '" data-field="dns_provider" placeholder="dns_cf / dns_ali / dns_dp"></label>' +
             '<label>证书路径 <input value="' + escapeAttr(cert.cert_path || "") + '" data-cert="' + cert.id + '" data-field="cert_path"></label>' +
             '<label>私钥路径 <input value="' + escapeAttr(cert.key_path || "") + '" data-cert="' + cert.id + '" data-field="key_path"></label>' +
           '</div>' +
+          '<label>DNS 环境变量 <textarea data-cert="' + cert.id + '" data-field="dns_credentials" placeholder="CF_Token=...\\nCF_Account_ID=...">' + escapeHTML(cert.dns_credentials || "") + '</textarea></label>' +
+          '<label class="row"><input type="checkbox" data-cert="' + cert.id + '" data-field="auto_renew"> 自动续期</label>' +
           '<button class="danger" onclick="deleteCert(\'' + cert.id + '\')">删除证书</button>';
         $("certList").appendChild(card);
         card.querySelector('[data-field="mode"]').value = cert.mode || "file";
+        card.querySelector('[data-field="ca"]').value = cert.ca || "letsencrypt";
+        card.querySelector('[data-field="auto_renew"]').checked = !!cert.auto_renew;
       }
       $("certList").querySelectorAll("input, select").forEach(el => {
         el.oninput = () => {
           const cert = state.certificates.find(c => c.id === el.dataset.cert);
-          cert[el.dataset.field] = el.value;
+          cert[el.dataset.field] = el.type === "checkbox" ? el.checked : el.value;
           renderEditor();
+        };
+      });
+      $("certList").querySelectorAll("textarea").forEach(el => {
+        el.oninput = () => {
+          const cert = state.certificates.find(c => c.id === el.dataset.cert);
+          cert[el.dataset.field] = el.value;
         };
       });
     }
@@ -1103,6 +1472,20 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     async function deleteCert(id) {
       state = await fetch("/api/certificate/" + encodeURIComponent(id), {method: "DELETE"}).then(r => r.json());
       render();
+    }
+
+    async function issueCert(id) {
+      await saveState({render: false});
+      const res = await fetch("/api/certificate/" + encodeURIComponent(id) + "/issue", {method: "POST"});
+      const body = await res.json();
+      if (!res.ok) $("status").textContent = body.error || "证书签发失败";
+      await loadState();
+    }
+
+    async function refreshCert(id) {
+      await saveState({render: false});
+      await fetch("/api/certificate/" + encodeURIComponent(id) + "/status", {method: "POST"});
+      await loadState();
     }
 
     function renderEditor() {
