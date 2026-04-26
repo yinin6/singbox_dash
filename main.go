@@ -56,23 +56,29 @@ type PanelSettings struct {
 }
 
 type Certificate struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Mode           string    `json:"mode"`
-	ServerName     string    `json:"server_name"`
-	CertPath       string    `json:"cert_path"`
-	KeyPath        string    `json:"key_path"`
-	Email          string    `json:"email"`
-	CA             string    `json:"ca"`
-	Challenge      string    `json:"challenge"`
-	Webroot        string    `json:"webroot"`
-	DNSProvider    string    `json:"dns_provider"`
-	DNSCredentials string    `json:"dns_credentials"`
-	AutoRenew      bool      `json:"auto_renew"`
-	LastStatus     string    `json:"last_status"`
-	LastMessage    string    `json:"last_message"`
-	LastIssuedAt   time.Time `json:"last_issued_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	Mode               string    `json:"mode"`
+	ServerName         string    `json:"server_name"`
+	CertPath           string    `json:"cert_path"`
+	KeyPath            string    `json:"key_path"`
+	Email              string    `json:"email"`
+	CA                 string    `json:"ca"`
+	Challenge          string    `json:"challenge"`
+	Webroot            string    `json:"webroot"`
+	DNSProvider        string    `json:"dns_provider"`
+	DNSCredentials     string    `json:"dns_credentials"`
+	AutoRenew          bool      `json:"auto_renew"`
+	LastStatus         string    `json:"last_status"`
+	LastMessage        string    `json:"last_message"`
+	LastIssuedAt       time.Time `json:"last_issued_at"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	RealityPort        int       `json:"reality_port"`
+	RealityPrivateKey  string    `json:"reality_private_key"`
+	RealityPublicKey   string    `json:"reality_public_key"`
+	RealityShortID     string    `json:"reality_short_id"`
+	RealityMaxTimeDiff string    `json:"reality_max_time_diff"`
+	UTLSFingerprint    string    `json:"utls_fingerprint"`
 }
 
 type Service struct {
@@ -331,10 +337,34 @@ func normalizeState(s *AppState) {
 		if cert.ServerName == "" {
 			cert.ServerName = s.Panel.Host
 		}
+		if cert.Mode == "reality" && (cert.ServerName == "" || net.ParseIP(cert.ServerName) != nil) {
+			cert.ServerName = "www.cloudflare.com"
+		}
 		if cert.Email == "" {
 			cert.Email = "admin@" + strings.TrimPrefix(cert.ServerName, "*.")
 		}
-		if cert.Mode != "file" {
+		if cert.RealityPort == 0 {
+			cert.RealityPort = 443
+		}
+		if cert.RealityShortID == "" {
+			cert.RealityShortID = randomHex(4)
+		}
+		if cert.RealityMaxTimeDiff == "" {
+			cert.RealityMaxTimeDiff = "1m"
+		}
+		if cert.UTLSFingerprint == "" {
+			cert.UTLSFingerprint = "chrome"
+		}
+		if cert.Mode == "reality" {
+			if cert.RealityPrivateKey == "" || cert.RealityPublicKey == "" {
+				cert.LastStatus = "missing_key"
+				cert.LastMessage = "Reality keypair is required"
+			} else if cert.LastStatus == "" || cert.LastStatus == "not_issued" {
+				cert.LastStatus = "ready"
+				cert.LastMessage = "Reality profile is ready"
+			}
+		}
+		if cert.Mode != "file" && cert.Mode != "reality" {
 			base := filepath.ToSlash(filepath.Join(stateDir, "certs", cert.ID))
 			if cert.CertPath == "" || strings.HasPrefix(cert.CertPath, "/etc/sing-box/cert/") {
 				cert.CertPath = filepath.ToSlash(filepath.Join(base, "fullchain.pem"))
@@ -589,6 +619,10 @@ func certificateItemHandler(w http.ResponseWriter, r *http.Request) {
 		certificateStatusHandler(w, r, id)
 		return
 	}
+	if len(parts) == 2 && parts[1] == "reality-keypair" {
+		certificateRealityKeypairHandler(w, r, id)
+		return
+	}
 	switch r.Method {
 	case http.MethodDelete:
 		err := store.mutate(func(s *AppState) error {
@@ -649,6 +683,39 @@ func certificateStatusHandler(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	writeJSON(w, out)
+}
+
+func certificateRealityKeypairHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	keypair, err := generateRealityKeypair(store.snapshot().Panel.SingBoxPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err = store.mutate(func(s *AppState) error {
+		for i := range s.Certificates {
+			if s.Certificates[i].ID == id {
+				s.Certificates[i].Mode = "reality"
+				s.Certificates[i].RealityPrivateKey = keypair["private_key"]
+				s.Certificates[i].RealityPublicKey = keypair["public_key"]
+				if s.Certificates[i].RealityShortID == "" {
+					s.Certificates[i].RealityShortID = randomHex(4)
+				}
+				s.Certificates[i].LastStatus = "ready"
+				s.Certificates[i].LastMessage = "Reality keypair generated"
+				return nil
+			}
+		}
+		return fmt.Errorf("certificate %s not found", id)
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, store.snapshot())
 }
 
 func serverConfigHandler(w http.ResponseWriter, r *http.Request) {
@@ -820,18 +887,18 @@ func buildClientConfig(state AppState, userID string) (map[string]any, error) {
 		}
 		if svc.TLS {
 			var tls map[string]any
-			if svc.TLSMode == "reality" {
+			if reality, ok := realityProfile(state, svc); ok {
 				tls = map[string]any{
 					"enabled":     true,
-					"server_name": svc.RealityHandshakeServer,
+					"server_name": reality.HandshakeServer,
 					"utls": map[string]any{
 						"enabled":     true,
-						"fingerprint": svc.UTLSFingerprint,
+						"fingerprint": reality.Fingerprint,
 					},
 					"reality": map[string]any{
 						"enabled":    true,
-						"public_key": svc.RealityPublicKey,
-						"short_id":   svc.RealityShortID,
+						"public_key": reality.PublicKey,
+						"short_id":   reality.ShortID,
 					},
 				}
 			} else {
@@ -882,12 +949,12 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 			q := url.Values{}
 			q.Set("encryption", "none")
 			if svc.TLS {
-				if svc.TLSMode == "reality" {
+				if reality, ok := realityProfile(state, svc); ok {
 					q.Set("security", "reality")
-					q.Set("sni", svc.RealityHandshakeServer)
-					q.Set("fp", svc.UTLSFingerprint)
-					q.Set("pbk", svc.RealityPublicKey)
-					q.Set("sid", svc.RealityShortID)
+					q.Set("sni", reality.HandshakeServer)
+					q.Set("fp", reality.Fingerprint)
+					q.Set("pbk", reality.PublicKey)
+					q.Set("sid", reality.ShortID)
 				} else {
 					cert := certByID(state, svc.CertID)
 					q.Set("security", "tls")
@@ -951,15 +1018,26 @@ func issueCertificate(id string) (Certificate, error) {
 				continue
 			}
 			cert = s.Certificates[i]
-			if err := prepareCertificatePaths(cert); err != nil {
-				s.Certificates[i].LastStatus = "error"
-				s.Certificates[i].LastMessage = err.Error()
-				cert = s.Certificates[i]
-				return nil
+			if cert.Mode != "reality" {
+				if err := prepareCertificatePaths(cert); err != nil {
+					s.Certificates[i].LastStatus = "error"
+					s.Certificates[i].LastMessage = err.Error()
+					cert = s.Certificates[i]
+					return nil
+				}
 			}
 			switch cert.Mode {
 			case "self_signed":
 				runErr = writeSelfSignedCertificate(cert)
+			case "reality":
+				if cert.RealityPrivateKey == "" || cert.RealityPublicKey == "" {
+					var keypair map[string]string
+					keypair, runErr = generateRealityKeypair(s.Panel.SingBoxPath)
+					if runErr == nil {
+						s.Certificates[i].RealityPrivateKey = keypair["private_key"]
+						s.Certificates[i].RealityPublicKey = keypair["public_key"]
+					}
+				}
 			case "acme_http", "acme_tls_alpn", "acme_dns":
 				runErr = runACMEScript(cert)
 			case "file":
@@ -974,9 +1052,16 @@ func issueCertificate(id string) (Certificate, error) {
 				return nil
 			}
 			s.Certificates[i].LastStatus = "issued"
-			s.Certificates[i].LastMessage = "certificate issued"
+			if s.Certificates[i].Mode == "reality" {
+				s.Certificates[i].LastStatus = "ready"
+				s.Certificates[i].LastMessage = "Reality profile is ready"
+			} else {
+				s.Certificates[i].LastMessage = "certificate issued"
+			}
 			s.Certificates[i].LastIssuedAt = time.Now()
-			refreshCertificateStatus(&s.Certificates[i])
+			if s.Certificates[i].Mode != "reality" {
+				refreshCertificateStatus(&s.Certificates[i])
+			}
 			cert = s.Certificates[i]
 			return nil
 		}
@@ -1500,22 +1585,22 @@ func certificateSHA256Hex(path string) (string, error) {
 }
 
 func tlsConfig(state AppState, svc Service) map[string]any {
-	if svc.TLSMode == "reality" {
+	if reality, ok := realityProfile(state, svc); ok {
 		tls := map[string]any{
 			"enabled":     true,
-			"server_name": svc.RealityHandshakeServer,
+			"server_name": reality.HandshakeServer,
 			"reality": map[string]any{
 				"enabled":     true,
-				"private_key": svc.RealityPrivateKey,
-				"short_id":    []string{svc.RealityShortID},
+				"private_key": reality.PrivateKey,
+				"short_id":    []string{reality.ShortID},
 				"handshake": map[string]any{
-					"server":      svc.RealityHandshakeServer,
-					"server_port": svc.RealityHandshakePort,
+					"server":      reality.HandshakeServer,
+					"server_port": reality.HandshakePort,
 				},
 			},
 		}
-		if svc.RealityMaxTimeDiff != "" {
-			tls["reality"].(map[string]any)["max_time_difference"] = svc.RealityMaxTimeDiff
+		if reality.MaxTimeDiff != "" {
+			tls["reality"].(map[string]any)["max_time_difference"] = reality.MaxTimeDiff
 		}
 		return tls
 	}
@@ -1527,6 +1612,43 @@ func tlsConfig(state AppState, svc Service) map[string]any {
 	tls["certificate_path"] = cert.CertPath
 	tls["key_path"] = cert.KeyPath
 	return tls
+}
+
+type RealityProfile struct {
+	HandshakeServer string
+	HandshakePort   int
+	PrivateKey      string
+	PublicKey       string
+	ShortID         string
+	MaxTimeDiff     string
+	Fingerprint     string
+}
+
+func realityProfile(state AppState, svc Service) (RealityProfile, bool) {
+	cert := certByID(state, svc.CertID)
+	if cert.Mode == "reality" {
+		return RealityProfile{
+			HandshakeServer: cert.ServerName,
+			HandshakePort:   cert.RealityPort,
+			PrivateKey:      cert.RealityPrivateKey,
+			PublicKey:       cert.RealityPublicKey,
+			ShortID:         cert.RealityShortID,
+			MaxTimeDiff:     cert.RealityMaxTimeDiff,
+			Fingerprint:     cert.UTLSFingerprint,
+		}, true
+	}
+	if svc.TLSMode == "reality" {
+		return RealityProfile{
+			HandshakeServer: svc.RealityHandshakeServer,
+			HandshakePort:   svc.RealityHandshakePort,
+			PrivateKey:      svc.RealityPrivateKey,
+			PublicKey:       svc.RealityPublicKey,
+			ShortID:         svc.RealityShortID,
+			MaxTimeDiff:     svc.RealityMaxTimeDiff,
+			Fingerprint:     svc.UTLSFingerprint,
+		}, true
+	}
+	return RealityProfile{}, false
 }
 
 func transportConfig(svc Service) map[string]any {
@@ -1885,7 +2007,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         <div class="card stack">
           <div class="row between">
             <h3>Reality</h3>
-            <button onclick="generateRealityKeypair()">生成密钥</button>
+            <div class="muted">推荐在证书管理中维护 Reality 档案；这里保留兼容旧配置。</div>
           </div>
           <div class="grid">
             <label>握手域名 <input id="realityHandshakeServer" oninput="updateService()" placeholder="www.cloudflare.com"></label>
@@ -2008,12 +2130,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         card.innerHTML =
           '<div class="row between">' +
             '<div class="cert-status"><strong>' + escapeHTML(cert.last_status || "unknown") + '</strong><br>' + escapeHTML(cert.last_message || "") + '<br>到期：' + escapeHTML(expires) + '</div>' +
-            '<div class="row"><button onclick="issueCert(\'' + cert.id + '\')">签发/续期</button><button onclick="refreshCert(\'' + cert.id + '\')">刷新</button></div>' +
+            '<div class="row"><button onclick="issueCert(\'' + cert.id + '\')">签发/续期</button><button onclick="refreshCert(\'' + cert.id + '\')">刷新</button><button onclick="generateCertRealityKeypair(\'' + cert.id + '\')">Reality 密钥</button></div>' +
           '</div>' +
           '<div class="grid">' +
             '<label>名称 <input value="' + escapeAttr(cert.name || "") + '" data-cert="' + cert.id + '" data-field="name"></label>' +
             '<label>模式 <select data-cert="' + cert.id + '" data-field="mode">' +
-              '<option value="file">手动文件</option><option value="self_signed">自签名</option><option value="acme_http">ACME HTTP-01</option><option value="acme_tls_alpn">ACME TLS-ALPN-01</option><option value="acme_dns">ACME DNS-01</option>' +
+              '<option value="file">手动文件</option><option value="self_signed">自签名</option><option value="reality">Reality</option><option value="acme_http">ACME HTTP-01</option><option value="acme_tls_alpn">ACME TLS-ALPN-01</option><option value="acme_dns">ACME DNS-01</option>' +
             '</select></label>' +
             '<label>服务名 <input value="' + escapeAttr(cert.server_name || "") + '" data-cert="' + cert.id + '" data-field="server_name"></label>' +
             '<label>邮箱 <input value="' + escapeAttr(cert.email || "") + '" data-cert="' + cert.id + '" data-field="email"></label>' +
@@ -2024,6 +2146,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
             '<label>DNS Provider <input value="' + escapeAttr(cert.dns_provider || "") + '" data-cert="' + cert.id + '" data-field="dns_provider" placeholder="dns_cf / dns_ali / dns_dp"></label>' +
             '<label>证书路径 <input value="' + escapeAttr(cert.cert_path || "") + '" data-cert="' + cert.id + '" data-field="cert_path"></label>' +
             '<label>私钥路径 <input value="' + escapeAttr(cert.key_path || "") + '" data-cert="' + cert.id + '" data-field="key_path"></label>' +
+            '<label>Reality 端口 <input value="' + escapeAttr(cert.reality_port || "443") + '" data-cert="' + cert.id + '" data-field="reality_port" type="number" min="1" max="65535"></label>' +
+            '<label>Reality Private Key <input value="' + escapeAttr(cert.reality_private_key || "") + '" data-cert="' + cert.id + '" data-field="reality_private_key"></label>' +
+            '<label>Reality Public Key <input value="' + escapeAttr(cert.reality_public_key || "") + '" data-cert="' + cert.id + '" data-field="reality_public_key"></label>' +
+            '<label>Reality Short ID <input value="' + escapeAttr(cert.reality_short_id || "") + '" data-cert="' + cert.id + '" data-field="reality_short_id"></label>' +
+            '<label>uTLS 指纹 <select data-cert="' + cert.id + '" data-field="utls_fingerprint"><option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option><option value="edge">edge</option><option value="ios">ios</option><option value="android">android</option></select></label>' +
+            '<label>Reality 最大时间差 <input value="' + escapeAttr(cert.reality_max_time_diff || "1m") + '" data-cert="' + cert.id + '" data-field="reality_max_time_diff"></label>' +
           '</div>' +
           '<label>DNS 环境变量 <textarea data-cert="' + cert.id + '" data-field="dns_credentials" placeholder="CF_Token=...\\nCF_Account_ID=...">' + escapeHTML(cert.dns_credentials || "") + '</textarea></label>' +
           '<label class="row"><input type="checkbox" data-cert="' + cert.id + '" data-field="auto_renew"> 自动续期</label>' +
@@ -2032,6 +2160,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         card.querySelector('[data-field="mode"]').value = cert.mode || "file";
         card.querySelector('[data-field="ca"]').value = cert.ca || "letsencrypt";
         card.querySelector('[data-field="auto_renew"]').checked = !!cert.auto_renew;
+        card.querySelector('[data-field="utls_fingerprint"]').value = cert.utls_fingerprint || "chrome";
       }
       $("certList").querySelectorAll("input, select").forEach(el => {
         el.oninput = () => {
@@ -2065,6 +2194,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       await saveState({render: false});
       await fetch("/api/certificate/" + encodeURIComponent(id) + "/status", {method: "POST"});
       await loadState();
+    }
+
+    async function generateCertRealityKeypair(id) {
+      await saveState({render: false});
+      state = await fetch("/api/certificate/" + encodeURIComponent(id) + "/reality-keypair", {method: "POST"}).then(r => r.json());
+      render();
     }
 
     function renderEditor() {
@@ -2158,15 +2293,6 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       svc.utls_fingerprint = $("utlsFingerprint").value;
       svc.reality_max_time_diff = $("realityMaxTimeDiff").value;
       renderServices();
-    }
-
-    async function generateRealityKeypair() {
-      const svc = currentService();
-      if (!svc) return;
-      await saveState({render: false});
-      state = await fetch("/api/service/" + encodeURIComponent(svc.id) + "/reality-keypair", {method: "POST"}).then(r => r.json());
-      currentServiceId = svc.id;
-      render();
     }
 
     function addUser() {

@@ -11,7 +11,7 @@ Current goals:
 - Export a selected user's client config.
 - Provide a plain subscription endpoint with common share links.
 
-The VLESS editor supports `flow=xtls-rprx-vision`, standard TLS, and Reality. The default VLESS profile uses TCP + TLS + Vision because newer Xray clients have removed legacy HTTP transport and warn on WebSocket.
+The VLESS editor supports `flow=xtls-rprx-vision`, standard TLS, and Reality. Reality can now be managed through certificate profiles, so one Reality keypair and handshake target can be reused across multiple services.
 
 ## Run
 

@@ -32,7 +32,7 @@ Supported transport knobs:
 - HTTP/H2
 - UDP
 
-VLESS users can set `flow=xtls-rprx-vision` and choose standard TLS or Reality. Reality stores the server private key, public key, short ID, handshake target, and uTLS fingerprint at the service level because it replaces certificate-backed TLS for that inbound. The default VLESS profile is TCP + TLS + Vision for cross-client compatibility. The panel intentionally does not emit Xray-only `xhttp` or `seed` options into sing-box configs until sing-box supports compatible fields.
+VLESS users can set `flow=xtls-rprx-vision` and choose standard TLS or Reality. Reality is now supported as a certificate profile type, so the private key, public key, short ID, handshake target, and uTLS fingerprint can be managed once and reused by multiple services. Service-level Reality fields remain as a compatibility fallback. The default VLESS profile is TCP + TLS + Vision for cross-client compatibility. The panel intentionally does not emit Xray-only `xhttp` or `seed` options into sing-box configs until sing-box supports compatible fields.
 
 ## Planned modules
 
