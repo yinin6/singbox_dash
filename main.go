@@ -13,6 +13,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -745,10 +746,14 @@ func buildClientConfig(state AppState, userID string) (map[string]any, error) {
 		}
 		if svc.TLS {
 			cert := certByID(state, svc.CertID)
-			ob["tls"] = map[string]any{
+			tls := map[string]any{
 				"enabled":     true,
 				"server_name": cert.ServerName,
 			}
+			if cert.Mode == "self_signed" {
+				tls["insecure"] = true
+			}
+			ob["tls"] = tls
 		}
 		if transport := transportConfig(svc); transport != nil {
 			ob["transport"] = transport
@@ -786,8 +791,12 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 			q := url.Values{}
 			q.Set("encryption", "none")
 			if svc.TLS {
+				cert := certByID(state, svc.CertID)
 				q.Set("security", "tls")
-				q.Set("sni", certByID(state, svc.CertID).ServerName)
+				q.Set("sni", cert.ServerName)
+				if cert.Mode == "self_signed" {
+					q.Set("allowInsecure", "1")
+				}
 			}
 			if svc.Transport != "tcp" {
 				q.Set("type", svc.Transport)
@@ -1190,7 +1199,11 @@ func writeSelfSignedCertificate(cert Certificate) error {
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              []string{cert.ServerName},
+	}
+	if ip := net.ParseIP(cert.ServerName); ip != nil {
+		tpl.IPAddresses = []net.IP{ip}
+	} else {
+		tpl.DNSNames = []string{cert.ServerName}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tpl, &tpl, &key.PublicKey, key)
 	if err != nil {
