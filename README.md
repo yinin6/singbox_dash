@@ -13,6 +13,23 @@ Current goals:
 
 The VLESS editor supports `flow=xtls-rprx-vision`, standard TLS, and Reality. Reality can now be managed through certificate profiles, so one Reality keypair and handshake target can be reused across multiple services.
 
+## Project layout
+
+The project is now split into a lighter frontend/backend structure:
+
+```text
+app.go              bootstrap and server startup
+models.go           state models and normalization
+store.go            persistence and state mutation helpers
+server.go           HTTP handlers and sing-box domain logic
+web.go              route wiring and static asset serving
+web/index.html      panel shell
+web/assets/app.js   frontend behavior
+web/assets/styles.css  frontend styles
+```
+
+This keeps UI iteration independent from Go handler changes, and removes the old single-file embedded page template.
+
 ## Run
 
 ```bash

@@ -8,7 +8,12 @@ singbox_dash is intended to be a small sing-box control panel with three clear l
 2. Security material: certificate profiles that can be reused by several services.
 3. Output adapters: sing-box server config, sing-box client config, and subscription/share links.
 
-The current implementation focuses on configuration generation and leaves process control as a later module.
+The implementation is now also split by delivery boundary:
+
+- backend Go files for state, persistence, handlers, and sing-box integration
+- static frontend assets under `web/`
+
+This removes the original monolithic embedded HTML page and makes it easier to maintain the UI separately from server-side behavior.
 
 ## Current model
 
