@@ -76,18 +76,26 @@ type Certificate struct {
 }
 
 type Service struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Protocol  string `json:"protocol"`
-	Enabled   bool   `json:"enabled"`
-	Listen    string `json:"listen"`
-	Port      int    `json:"port"`
-	TLS       bool   `json:"tls"`
-	CertID    string `json:"cert_id"`
-	Transport string `json:"transport"`
-	Path      string `json:"path"`
-	Method    string `json:"method"`
-	Users     []User `json:"users"`
+	ID                     string `json:"id"`
+	Name                   string `json:"name"`
+	Protocol               string `json:"protocol"`
+	Enabled                bool   `json:"enabled"`
+	Listen                 string `json:"listen"`
+	Port                   int    `json:"port"`
+	TLS                    bool   `json:"tls"`
+	TLSMode                string `json:"tls_mode"`
+	CertID                 string `json:"cert_id"`
+	Transport              string `json:"transport"`
+	Path                   string `json:"path"`
+	Method                 string `json:"method"`
+	RealityHandshakeServer string `json:"reality_handshake_server"`
+	RealityHandshakePort   int    `json:"reality_handshake_port"`
+	RealityPrivateKey      string `json:"reality_private_key"`
+	RealityPublicKey       string `json:"reality_public_key"`
+	RealityShortID         string `json:"reality_short_id"`
+	RealityMaxTimeDiff     string `json:"reality_max_time_diff"`
+	UTLSFingerprint        string `json:"utls_fingerprint"`
+	Users                  []User `json:"users"`
 }
 
 type User struct {
@@ -232,6 +240,7 @@ func defaultState() AppState {
 				Listen:    "::",
 				Port:      443,
 				TLS:       true,
+				TLSMode:   "standard",
 				CertID:    certID,
 				Transport: "tcp",
 				Users: []User{
@@ -246,6 +255,7 @@ func defaultState() AppState {
 				Listen:    "::",
 				Port:      8443,
 				TLS:       true,
+				TLSMode:   "standard",
 				CertID:    certID,
 				Transport: "tcp",
 				Users: []User{
@@ -260,6 +270,7 @@ func defaultState() AppState {
 				Listen:    "::",
 				Port:      8444,
 				TLS:       true,
+				TLSMode:   "standard",
 				CertID:    certID,
 				Transport: "udp",
 				Users: []User{
@@ -350,6 +361,24 @@ func normalizeState(s *AppState) {
 		if svc.Transport == "" {
 			svc.Transport = "tcp"
 		}
+		if svc.TLSMode == "" {
+			svc.TLSMode = "standard"
+		}
+		if svc.RealityHandshakeServer == "" {
+			svc.RealityHandshakeServer = "www.cloudflare.com"
+		}
+		if svc.RealityHandshakePort == 0 {
+			svc.RealityHandshakePort = 443
+		}
+		if svc.RealityShortID == "" {
+			svc.RealityShortID = randomHex(4)
+		}
+		if svc.RealityMaxTimeDiff == "" {
+			svc.RealityMaxTimeDiff = "1m"
+		}
+		if svc.UTLSFingerprint == "" {
+			svc.UTLSFingerprint = "chrome"
+		}
 		if svc.Method == "" && svc.Protocol == "shadowsocks" {
 			svc.Method = "2022-blake3-aes-128-gcm"
 		}
@@ -418,16 +447,22 @@ func serviceCreateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := store.mutate(func(s *AppState) error {
 		svc := Service{
-			ID:        "svc-" + randomHex(6),
-			Name:      "New Service",
-			Protocol:  "vless",
-			Enabled:   true,
-			Listen:    "::",
-			Port:      nextPort(s.Services),
-			TLS:       true,
-			Transport: "tcp",
+			ID:                     "svc-" + randomHex(6),
+			Name:                   "New Service",
+			Protocol:               "vless",
+			Enabled:                true,
+			Listen:                 "::",
+			Port:                   nextPort(s.Services),
+			TLS:                    true,
+			TLSMode:                "standard",
+			Transport:              "tcp",
+			RealityHandshakeServer: "www.cloudflare.com",
+			RealityHandshakePort:   443,
+			RealityShortID:         randomHex(4),
+			RealityMaxTimeDiff:     "1m",
+			UTLSFingerprint:        "chrome",
 			Users: []User{
-				{ID: "user-" + randomHex(6), Name: "default", UUID: randomUUID(), Password: randomHex(14)},
+				{ID: "user-" + randomHex(6), Name: "default", UUID: randomUUID(), Password: randomHex(14), Flow: "xtls-rprx-vision"},
 			},
 		}
 		if len(s.Certificates) > 0 {
@@ -443,9 +478,17 @@ func serviceCreateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func serviceItemHandler(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/service/")
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/service/"), "/"), "/")
+	id := ""
+	if len(parts) > 0 {
+		id = parts[0]
+	}
 	if id == "" {
 		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "reality-keypair" {
+		serviceRealityKeypairHandler(w, r, id)
 		return
 	}
 	switch r.Method {
@@ -467,6 +510,36 @@ func serviceItemHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func serviceRealityKeypairHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	keypair, err := generateRealityKeypair(store.snapshot().Panel.SingBoxPath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err = store.mutate(func(s *AppState) error {
+		for i := range s.Services {
+			if s.Services[i].ID == id {
+				s.Services[i].RealityPrivateKey = keypair["private_key"]
+				s.Services[i].RealityPublicKey = keypair["public_key"]
+				if s.Services[i].RealityShortID == "" {
+					s.Services[i].RealityShortID = randomHex(4)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("service %s not found", id)
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, store.snapshot())
 }
 
 func certificateCreateHandler(w http.ResponseWriter, r *http.Request) {
@@ -746,13 +819,30 @@ func buildClientConfig(state AppState, userID string) (map[string]any, error) {
 			ob["password"] = user.Password
 		}
 		if svc.TLS {
-			cert := certByID(state, svc.CertID)
-			tls := map[string]any{
-				"enabled":     true,
-				"server_name": cert.ServerName,
-			}
-			if cert.Mode == "self_signed" {
-				tls["insecure"] = true
+			var tls map[string]any
+			if svc.TLSMode == "reality" {
+				tls = map[string]any{
+					"enabled":     true,
+					"server_name": svc.RealityHandshakeServer,
+					"utls": map[string]any{
+						"enabled":     true,
+						"fingerprint": svc.UTLSFingerprint,
+					},
+					"reality": map[string]any{
+						"enabled":    true,
+						"public_key": svc.RealityPublicKey,
+						"short_id":   svc.RealityShortID,
+					},
+				}
+			} else {
+				cert := certByID(state, svc.CertID)
+				tls = map[string]any{
+					"enabled":     true,
+					"server_name": cert.ServerName,
+				}
+				if cert.Mode == "self_signed" {
+					tls["insecure"] = true
+				}
 			}
 			ob["tls"] = tls
 		}
@@ -792,13 +882,21 @@ func buildSubscription(state AppState, userID string) []subscriptionLine {
 			q := url.Values{}
 			q.Set("encryption", "none")
 			if svc.TLS {
-				cert := certByID(state, svc.CertID)
-				q.Set("security", "tls")
-				q.Set("sni", cert.ServerName)
-				if cert.Mode == "self_signed" {
-					if pcs, err := certificateSHA256Hex(cert.CertPath); err == nil {
-						q.Set("pcs", pcs)
-						q.Set("vcn", cert.ServerName)
+				if svc.TLSMode == "reality" {
+					q.Set("security", "reality")
+					q.Set("sni", svc.RealityHandshakeServer)
+					q.Set("fp", svc.UTLSFingerprint)
+					q.Set("pbk", svc.RealityPublicKey)
+					q.Set("sid", svc.RealityShortID)
+				} else {
+					cert := certByID(state, svc.CertID)
+					q.Set("security", "tls")
+					q.Set("sni", cert.ServerName)
+					if cert.Mode == "self_signed" {
+						if pcs, err := certificateSHA256Hex(cert.CertPath); err == nil {
+							q.Set("pcs", pcs)
+							q.Set("vcn", cert.ServerName)
+						}
 					}
 				}
 			}
@@ -1304,6 +1402,37 @@ func runCommandWithEnv(name string, args []string, envText string) (string, erro
 	return string(out), err
 }
 
+func generateRealityKeypair(binPath string) (map[string]string, error) {
+	bin, err := resolveSingBoxPath(binPath)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "generate", "reality-keypair")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, errors.New("generate reality keypair timed out")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: %s", err, trimCommandOutput(string(out)))
+	}
+	keys := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "PrivateKey:"):
+			keys["private_key"] = strings.TrimSpace(strings.TrimPrefix(line, "PrivateKey:"))
+		case strings.HasPrefix(line, "PublicKey:"):
+			keys["public_key"] = strings.TrimSpace(strings.TrimPrefix(line, "PublicKey:"))
+		}
+	}
+	if keys["private_key"] == "" || keys["public_key"] == "" {
+		return nil, fmt.Errorf("unexpected reality keypair output: %s", trimCommandOutput(string(out)))
+	}
+	return keys, nil
+}
+
 func parseEnvLines(text string) []string {
 	lines := []string{}
 	for _, line := range strings.Split(text, "\n") {
@@ -1371,6 +1500,25 @@ func certificateSHA256Hex(path string) (string, error) {
 }
 
 func tlsConfig(state AppState, svc Service) map[string]any {
+	if svc.TLSMode == "reality" {
+		tls := map[string]any{
+			"enabled":     true,
+			"server_name": svc.RealityHandshakeServer,
+			"reality": map[string]any{
+				"enabled":     true,
+				"private_key": svc.RealityPrivateKey,
+				"short_id":    []string{svc.RealityShortID},
+				"handshake": map[string]any{
+					"server":      svc.RealityHandshakeServer,
+					"server_port": svc.RealityHandshakePort,
+				},
+			},
+		}
+		if svc.RealityMaxTimeDiff != "" {
+			tls["reality"].(map[string]any)["max_time_difference"] = svc.RealityMaxTimeDiff
+		}
+		return tls
+	}
 	cert := certByID(state, svc.CertID)
 	tls := map[string]any{
 		"enabled":     true,
@@ -1718,6 +1866,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
               <option value="udp">UDP</option>
             </select>
           </label>
+          <label>TLS 类型
+            <select id="svcTLSMode" onchange="updateService()">
+              <option value="standard">标准 TLS</option>
+              <option value="reality">Reality</option>
+            </select>
+          </label>
           <label>路径 / gRPC Service <input id="svcPath" oninput="updateService()" placeholder="/proxy"></label>
           <label>证书
             <select id="svcCert" onchange="updateService()"></select>
@@ -1727,6 +1881,23 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
         <div class="row">
           <label class="row"><input id="svcEnabled" type="checkbox" onchange="updateService()"> 启用</label>
           <label class="row"><input id="svcTLS" type="checkbox" onchange="updateService()"> TLS</label>
+        </div>
+        <div class="card stack">
+          <div class="row between">
+            <h3>Reality</h3>
+            <button onclick="generateRealityKeypair()">生成密钥</button>
+          </div>
+          <div class="grid">
+            <label>握手域名 <input id="realityHandshakeServer" oninput="updateService()" placeholder="www.cloudflare.com"></label>
+            <label>握手端口 <input id="realityHandshakePort" type="number" min="1" max="65535" oninput="updateService()"></label>
+            <label>Private Key <input id="realityPrivateKey" oninput="updateService()"></label>
+            <label>Public Key <input id="realityPublicKey" oninput="updateService()"></label>
+            <label>Short ID <input id="realityShortID" oninput="updateService()" placeholder="8 hex chars"></label>
+            <label>uTLS 指纹 <select id="utlsFingerprint" onchange="updateService()">
+              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option><option value="edge">edge</option><option value="ios">ios</option><option value="android">android</option>
+            </select></label>
+            <label>最大时间差 <input id="realityMaxTimeDiff" oninput="updateService()" placeholder="1m"></label>
+          </div>
         </div>
         <div class="row between">
           <h3>用户</h3>
@@ -1909,10 +2080,18 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       $("svcListen").value = svc.listen || "::";
       $("svcPort").value = svc.port || 443;
       $("svcTransport").value = svc.transport || "tcp";
+      $("svcTLSMode").value = svc.tls_mode || "standard";
       $("svcPath").value = svc.path || "";
       $("svcMethod").value = svc.method || "";
       $("svcEnabled").checked = !!svc.enabled;
       $("svcTLS").checked = !!svc.tls;
+      $("realityHandshakeServer").value = svc.reality_handshake_server || "www.cloudflare.com";
+      $("realityHandshakePort").value = svc.reality_handshake_port || 443;
+      $("realityPrivateKey").value = svc.reality_private_key || "";
+      $("realityPublicKey").value = svc.reality_public_key || "";
+      $("realityShortID").value = svc.reality_short_id || "";
+      $("utlsFingerprint").value = svc.utls_fingerprint || "chrome";
+      $("realityMaxTimeDiff").value = svc.reality_max_time_diff || "1m";
       $("svcCert").innerHTML = '<option value="">未选择</option>' + (state.certificates || []).map(c => '<option value="' + c.id + '">' + escapeHTML(c.name || c.id) + '</option>').join("");
       $("svcCert").value = svc.cert_id || "";
       renderUsers(svc);
@@ -1965,12 +2144,29 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
       svc.listen = $("svcListen").value;
       svc.port = Number($("svcPort").value || 0);
       svc.transport = $("svcTransport").value;
+      svc.tls_mode = $("svcTLSMode").value;
       svc.path = $("svcPath").value;
       svc.method = $("svcMethod").value;
       svc.cert_id = $("svcCert").value;
       svc.enabled = $("svcEnabled").checked;
       svc.tls = $("svcTLS").checked;
+      svc.reality_handshake_server = $("realityHandshakeServer").value;
+      svc.reality_handshake_port = Number($("realityHandshakePort").value || 443);
+      svc.reality_private_key = $("realityPrivateKey").value;
+      svc.reality_public_key = $("realityPublicKey").value;
+      svc.reality_short_id = $("realityShortID").value;
+      svc.utls_fingerprint = $("utlsFingerprint").value;
+      svc.reality_max_time_diff = $("realityMaxTimeDiff").value;
       renderServices();
+    }
+
+    async function generateRealityKeypair() {
+      const svc = currentService();
+      if (!svc) return;
+      await saveState({render: false});
+      state = await fetch("/api/service/" + encodeURIComponent(svc.id) + "/reality-keypair", {method: "POST"}).then(r => r.json());
+      currentServiceId = svc.id;
+      render();
     }
 
     function addUser() {
